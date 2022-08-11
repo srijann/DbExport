@@ -1,0 +1,312 @@
+#include "DBEXPORT.h"
+
+#define _MERCHANT 0
+#define _AUTHRULE 0
+#define _DATAREQ  1
+#define _LISTS    0
+#define _POSRULES 0
+#define _RESPONSE 0
+#define _UNVFUNDS 0
+//#define _SECRULES 0 - not in v23
+
+
+RDM_SESS SessionHandle;
+RDM_DB   DBHandle;
+FILE* SaveFile;
+char* SaveFileName;
+int   RecordCount;
+
+static BOOL Interactive=FALSE;
+
+#include "posfile.h"
+
+#define WRITE(value) if ( ! Write(f,value) ) return false
+#define WRITELAST(value) if ( ! Write(f,value,true) ) return false
+
+// Generic Formatter Class
+class CFormatter
+{
+ protected:
+
+ bool Write(FILE* f,char* string,bool Last=false)
+ {
+  if ( fwrite(string,strlen(string),1,f) != 1 )
+   return false;
+
+  if ( ! Last )
+   if ( fwrite(",",1,1,f) != 1 )
+    return false;
+
+  return true;
+ }
+
+
+ public:
+ virtual int Length() = 0;
+ virtual char* Buf() = 0;
+ virtual bool WriteFieldsTemplate(FILE*) = 0;
+ virtual bool WriteFields(FILE*) = 0;
+};
+
+
+
+// Derived Formatter class for Positive File
+class CPosFileFormatter : public CFormatter
+{
+ struct PosfileRecord Rec;
+ int Length() { return sizeof(Rec); }
+ char* Buf() { return (char*)&Rec; }
+ bool WriteFieldsTemplate(FILE* f)
+  {
+   WRITE("BankNumber");
+   WRITE("BankAccount");
+   WRITE("LicenseState");
+   WRITE("License");
+   WRITE("LastApproval");
+   WRITE("FirstApproval");
+   WRITE("NumApprovals");
+   WRITE("AmountApprovals");
+   WRITE("DateOfBirth");
+   #if 0
+   unsigned short Flags;
+   struct {
+      unsigned short NumberOfOverridesAllowed;
+      unsigned short OverridePeriod;
+      unsigned short MaxOverrideAmount;
+      unsigned short MaxOverrideAccum;
+      unsigned short SicCodeRestrictions[3];
+      char AccountRestrictions[3][4];
+   } Parms;
+   struct {
+      char ConsumerName[26];
+      char BusinessName[26];
+   } ConsumerInfo;
+   char PhoneKey[11];
+  #endif
+
+   return true;
+  }
+
+ bool WriteFields(FILE* f)
+  {
+   return true;
+  }
+};
+
+
+//---------------------------------
+// Come here to quit with exit code
+//---------------------------------
+void quit(int ecode)
+{
+ if ( SessionHandle )
+  {
+   d_close(SessionHandle);
+   s_logout(SessionHandle);
+  }
+ if ( ecode==EXIT_SUCCESS )
+  cout << "DBEXPORT Complete." << endl;
+ else
+  cout << "  !!!!!!!!!!!!!!!!!!!!!" << endl
+       << "  !!! DBEXPORT Aborted !!!" << endl
+       << "  !!!!!!!!!!!!!!!!!!!!!" << endl;
+
+ cout << endl;
+ exit(ecode);
+}
+
+//--------------
+// Open Database
+//--------------
+void Open(const char* dbName)
+{
+ int Status;
+
+ if ( (Status=d_open(dbName,"xq",SessionHandle,&DBHandle)) != S_OKAY )
+  {
+   if ( Status==S_EXOPENED )
+    cout << "Can't open " << dbName << ". The server process is still running." << endl;
+   else
+    cout << "d_open returned " << Status
+      << endl;
+   quit(EXIT_FAILURE);
+  }
+}
+
+//--------------------
+// Close open database
+//--------------------
+void Close()
+{
+ int Status=d_close(SessionHandle);
+
+ if ( Status != S_OKAY )
+  {
+   cout << "d_close returned " << Status
+     << endl;
+   quit(EXIT_FAILURE);
+  }
+}
+
+//--------------------
+// Initialize Database
+//--------------------
+void Init(const char* Name)
+{
+ int Status;
+
+ // Initialize database
+ Close();
+ if ( (Status=s_dbInit(Name,SessionHandle)) != S_OKAY )
+  {
+   cout << "s_dbinit returned " << Status << endl;
+   quit(EXIT_FAILURE);
+  }
+ Open(Name);
+}
+
+//--------------------------------------
+// Copy all records of file to temp file
+//--------------------------------------
+void Export(short Type,const char* Name,CFormatter& Formatter)
+{
+ int Status;
+ RecordCount=0;
+
+ strcpy(SaveFileName,DBPATH);
+ strcat(SaveFileName,Name);
+ strcat(SaveFileName,".exp");
+
+ cout << " Exporting Records to " << SaveFileName << "..." << endl;
+
+ if ( (SaveFile=fopen(SaveFileName, "w+b")) == NULL )
+  {
+   cout << "fopen of " << Name << " failed: " << strerror(errno) << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ if ( ! Formatter.WriteFieldsTemplate(SaveFile) )
+  {
+   cout << endl << "  fwrite failed: " << strerror(errno) << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ if ( (Status=d_recfrst(Type,DBHandle)) != S_OKAY )
+  {
+   if ( Status==S_NOTFOUND )
+    {
+     cout << "  " << RecordCount << " Records Saved" << endl;
+     return;
+    }
+   cout << "  d_recfrst returned " << Status << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ do
+  {
+   if ( (Status=d_recread(Type,Formatter.Buf(),DBHandle)) != S_OKAY )
+    {
+     cout << endl << "  d_recread returned " << Status << endl;
+     quit(EXIT_FAILURE);
+    }
+   if ( ! Formatter.WriteFields(SaveFile) )
+    {
+     cout << endl << "  fwrite failed: " << strerror(errno) << endl;
+     quit(EXIT_FAILURE);
+    }
+   cout << "  " << ++RecordCount << "\r";
+  }
+ while( (Status=d_recnext(DBHandle)) == S_OKAY );
+
+ cout << "  " << RecordCount << " Records Saved" << endl;
+
+ if ( Status != S_NOTFOUND )
+  {
+   cout << "d_recnext returned " << Status << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ if ( fseek(SaveFile,0,SEEK_SET) == -1 )
+  {
+   cout << "  fseek failed: " << strerror(errno) << endl;
+   quit(EXIT_FAILURE);
+  }
+}
+
+//-----------------------------------
+// Do ending steps after database unload
+//-----------------------------------
+void CloseAll()
+{
+ cout << " Closing Database...." << endl;
+ Close();
+ cout << endl;
+ fclose(SaveFile);
+}
+
+//----------------------
+// Unload the Positive File
+//----------------------
+#include "posfile.h"
+void ExportPositiveFile()
+{
+ CPosFileFormatter Format;
+
+ Open("posfile");
+ cout << "Exporting Positive File..." << endl;
+ Export(POSFILERECORD,"PosFile\\PosFile",Format);
+ CloseAll();
+}
+
+
+
+//------------------------------------------------------
+// Main function. Get Selection from Args or else prompt
+//------------------------------------------------------
+void main(int argc,const char* argv[])
+{
+ short status;
+
+ SaveFileName = new char[MAX_PATH+1];
+ cout << "Start" << endl;
+ // LOGIN
+ if ( (status=s_login("rds","admin","secret",&SessionHandle)) != S_OKAY )
+  {
+   cout << "s_login returned " << status << "\n";
+   quit(EXIT_FAILURE);
+  }
+
+ int Key;
+ if ( argc== 1 )
+  {
+   cout << "  1. Positive File" << endl;
+   cout << "  A. All Files" << endl;
+   cout << "Export which File?";
+   Key=getch();
+   Interactive = TRUE;
+  }
+ else
+  Key = argv[1][0];
+
+ bool ALL=false;
+ cout << endl;
+ switch( Key )
+  {
+   case 'A':
+   case 'a': ALL=true;
+
+   case '1': ExportPositiveFile();
+             if ( ! ALL )
+              break;
+
+
+   default:  cout << "Unrecognized Selection" << endl;
+             exit(EXIT_FAILURE);
+  }
+
+
+ // Success
+ quit(EXIT_SUCCESS);
+}
+
+

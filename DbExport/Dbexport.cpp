@@ -1,0 +1,669 @@
+#include "dbexport.h"
+#include <time.h>
+
+
+RDM_SESS SessionHandle;
+RDM_DB   DBHandle;
+RDM_DB   DBHandle2;
+FILE* SaveFile;
+char* SaveFileName;
+int   RecordCount;
+
+static BOOL Interactive=FALSE;
+
+#include "posfile.h"
+#include "spsmandb.h"
+
+#define COMMA if ( fwrite(",",1,1,f) != 1) return false
+#define CRLF if ( fwrite("\r\n",2,1,f) != 1 ) return false
+#define WRITE(value) if ( ! Write(f,value) ) return false
+#define WRITELAST(value) WRITE(value); CRLF
+#define WRITECOMMA(value) WRITE(value); COMMA
+#define WRITEDATE(value) if ( ! WriteDate(f,value) ) return false
+
+
+//------------------------
+// Generic Formatter Class
+//------------------------
+class CFormatter
+{
+ public:
+
+ // Write a Single Character, filtering out commas and non-printable
+ // characters
+ bool Write(FILE* f,char x)
+  {
+   if ( x == ',' ||
+        ! isprint(x) )
+    x = '?';
+
+   if ( fwrite(&x,1,1,f) != 1 )
+    return false;
+
+   return true;
+  }
+
+ // Write a String
+ bool Write(FILE* f,char* string)
+ {
+  if ( fwrite(string,strlen(string),1,f) != 1 )
+   return false;
+
+  return true;
+ }
+
+ // Write an Unsigned Long Value
+ bool Write(FILE* f,unsigned long value)
+ {
+  char formatBuf[20];
+
+  sprintf(formatBuf,"%ld",value);
+  return Write(f,formatBuf);
+ }
+
+
+ // Write an Unsigned Short Value
+ bool Write(FILE* f,unsigned short value)
+ {
+  return Write(f,(unsigned long)value);
+ }
+
+ // Write a Boolean as 0 or 1
+ bool Write(FILE* f,bool value)
+ {
+  if ( value )
+   return Write(f,'1');
+  else
+   return Write(f,'0');
+ }
+
+ // Write DOB in form YYYY-MM-DD
+ bool WriteDOB(FILE* f,unsigned long DOB)
+ {
+  int Year = (DOB % 100) + 1900;
+  int Month = ( DOB / 10000 ) % 100;
+  int Day = ( DOB / 100 ) % 100;
+
+  // Don't Output Invalid Dates
+  if ( Month==0 || Day==0 || Month > 12 || Day > 31 )
+   return true;
+
+  char formatBuf[40];
+  sprintf(formatBuf,"%04d-%02d-%02d",Year,Month,Day);
+
+  return Write(f,formatBuf);
+ }
+
+
+ // Write a Timestamp in form YYYY-MM-DD HH:MM:00
+ bool WriteDate(FILE* f,unsigned long Date)
+ {
+  if ( Date==0 )
+   return true;
+
+  struct tm* t=localtime( (time_t*)&Date);
+  char formatBuf[40];
+
+  sprintf(formatBuf,"%04d-%02d-%02d %02d:%02d",
+          t->tm_year + 1900, t->tm_mon+1, t->tm_mday,
+          t->tm_hour, t->tm_min);
+
+  return Write(f,formatBuf);
+ }
+
+
+ public:
+ virtual int Length() = 0;
+ virtual char* Buf() = 0;
+ virtual bool WriteFieldsTemplate(FILE*) = 0;
+ virtual bool WriteFields(FILE*) = 0;
+};
+
+ // This is a mini-version of the MerchantRec class that is used
+ // in authorizations. For some reason when I use the real one I
+ // get an inexplicable linker error. (J. Ely)
+ class MerchantRec
+ {
+  public:
+  struct MerchantRecord Data;
+
+   enum Enabler
+   {
+    MerchantService,
+    MerchantSic,
+    MerchantState,
+    MerchantZip,
+    MerchantTimeZone,
+    PrivateLabelName,
+    ProductClasses,
+    FedRegions,
+    GUAuthRules,
+    GUUnvFundsRules,
+    GUDataReq,
+    GUPosFileRules,
+    GURespMsg,
+    VFYAuthRules,
+    VFYUnvFundsRules,
+    VFYDataReq,
+    VFYPosFileRules,
+    VFYRespMsg,
+    ProductGroup,
+    MessageNumber
+   };
+
+
+  bool isRegionSelected(int Region)
+	{
+ 	 return (1<<Region) & Data.FedRegionBits;
+	}
+   //-------------------------------------
+	// Test if a field Enabler is on or off
+	//-------------------------------------
+	bool isFieldEnabled(int Field)
+	{
+ 	// If this is an account record, then all fields are always
+ 	// enabled. Fields are only disabled in station records to
+ 	// indicate that the Account default should be used.
+ 	if ( strlen(Data.MerchantID) == 3 )
+   	return true;
+
+ 	return (1 << Field) & Data.FieldEnablerBits;
+	}
+
+	//----------------------------------------------
+	// Merge a Station record into an account record
+	//----------------------------------------------
+	#define MERGEINT(n) if ( stationRec->isFieldEnabled(n) )\
+  		Data.n=stationRec->Data.n
+	#define MERGESTR(n) if ( stationRec->isFieldEnabled(n) )\
+  		strcpy(Data.n,stationRec->Data.n)
+	#define MERGECLASS(n,Enabler) if ( stationRec->isFieldEnabled(Enabler) )\
+  		strcpy(Data.Classes.n,stationRec->Data.Classes.n)
+	void Merge(MerchantRec* stationRec)
+	{
+    Data.MerchantRecTStamp = stationRec->Data.MerchantRecTStamp;
+ 	 if ( stationRec->isFieldEnabled(MerchantService) )
+  		{
+   	Data.MerchantService=stationRec->Data.MerchantService;
+   	Data.VerifyAmount=stationRec->Data.VerifyAmount;
+   	Data.PreauthDays=stationRec->Data.PreauthDays;
+   	Data.PreauthAmount=stationRec->Data.PreauthAmount;
+   	Data.HoldCheck1Percent=stationRec->Data.HoldCheck1Percent;
+   	Data.HoldCheckValuePercent=stationRec->Data.HoldCheckValuePercent;
+   	Data.HoldCheckAmount=stationRec->Data.HoldCheckAmount;
+  	}
+ 	MERGESTR(MerchantSic);
+ 	MERGESTR(MerchantState);
+ 	MERGESTR(MerchantZip);
+ 	MERGESTR(MessageNumber);
+ 	MERGEINT(MerchantTimeZone);
+ 	MERGEINT(ProductGroup);
+ 	MERGECLASS(Product,ProductClasses);
+ 	MERGECLASS(GUAuthRules,GUAuthRules);
+ 	MERGECLASS(GUAuthRulesSub,GUAuthRules);
+ 	MERGECLASS(GUUnvFundsRules,GUUnvFundsRules);
+ 	MERGECLASS(GUDataReq,GUDataReq);
+ 	MERGECLASS(GUPosFileRules,GUPosFileRules);
+ 	MERGECLASS(GURespMsg,GURespMsg);
+ 	MERGECLASS(VFYAuthRules,VFYAuthRules);
+ 	MERGECLASS(VFYAuthRulesSub,VFYAuthRules);
+ 	MERGECLASS(VFYUnvFundsRules,VFYUnvFundsRules);
+ 	MERGECLASS(VFYDataReq,VFYDataReq);
+ 	MERGECLASS(VFYPosFileRules,VFYPosFileRules);
+ 	MERGECLASS(VFYRespMsg,VFYRespMsg);
+
+ 	if ( stationRec->isFieldEnabled(FedRegions) )
+  		Data.FedRegionBits=stationRec->Data.FedRegionBits;
+
+ 	strcpy(Data.MerchantID,stationRec->Data.MerchantID);
+ 	strcpy(Data.MerchantName,stationRec->Data.MerchantName);
+	}
+
+};
+
+
+//------------------------------------------
+// Derived Formatter class for Merchant File
+//-------------------------------------------
+class CMerchantFileFormatter : public CFormatter
+{
+ public:
+
+ MerchantRec Rec;
+ MerchantRec StationRec;
+ MerchantRec AccountRec;
+
+ int Length() { return sizeof(Rec.Data); }
+ char* Buf() { return (char*)&Rec.Data; }
+
+ public:
+ bool WriteFieldsTemplate(FILE* f)
+ {
+   WRITECOMMA("ADDED");
+   WRITECOMMA("ID");
+   WRITECOMMA("Name");
+   WRITECOMMA("FedRegion1");
+   WRITECOMMA("FedRegion2");
+   WRITECOMMA("FedRegion3");
+   WRITECOMMA("FedRegion4");
+   WRITECOMMA("FedRegion5");
+   WRITECOMMA("FedRegion6");
+   WRITECOMMA("FedRegion7");
+   WRITECOMMA("FedRegion8");
+   WRITECOMMA("FedRegion9");
+   WRITECOMMA("FedRegion10");
+   WRITECOMMA("FedRegion11");
+   WRITECOMMA("FedRegion12");
+   WRITECOMMA("Sic");
+   WRITECOMMA("State");
+   WRITECOMMA("Zip");
+   WRITECOMMA("Service");
+   WRITECOMMA("TimeZone");
+   WRITECOMMA("VerifyAmount");
+   WRITECOMMA("PreauthDays");
+   WRITECOMMA("PreauthAmount");
+   WRITECOMMA("HoldCheckAmount");
+   WRITECOMMA("HoldCheck1Percent");
+   WRITECOMMA("HoldCheckValuePercent");
+   WRITECOMMA("ProductGroup");
+   WRITECOMMA("MessageNumber");
+   WRITECOMMA("ProductClass");
+   WRITECOMMA("GUAuthRules");
+   WRITECOMMA("GUAuthRulesSub");
+   WRITECOMMA("GUUnvFundsRules");
+   WRITECOMMA("GUDataReq");
+   WRITECOMMA("GUPosFileRules");
+   WRITECOMMA("GURespMsg");
+   WRITECOMMA("VFYAuthRules");
+   WRITECOMMA("VFYAuthRulesSub");
+   WRITECOMMA("VFYUnvFundsRules");
+   WRITECOMMA("VFYDataReq");
+   WRITECOMMA("VFYPosFileRules");
+   WRITELAST("VFYRespMsg");
+
+  return true;
+ }
+
+ bool WriteFields(FILE* f)
+ {
+   //If it's an account level record write it out and save it
+   //for merging.
+   if ( strlen(Rec.Data.MerchantID) == 3 )
+    memcpy(&AccountRec.Data,&Rec.Data,sizeof(Rec.Data));
+   else
+    if ( memcmp(Rec.Data.MerchantID,AccountRec.Data.MerchantID,3) == 0 )
+     {
+      memcpy(&StationRec.Data,&Rec.Data,sizeof(Rec.Data));
+      memcpy(&Rec.Data,&AccountRec.Data,sizeof(Rec.Data));
+      Rec.Merge(&StationRec);
+     }
+
+   WRITEDATE(Rec.Data.MerchantRecTStamp); COMMA;
+   WRITECOMMA(Rec.Data.MerchantID);
+   WRITECOMMA(Rec.Data.MerchantName);
+   int i;
+   for (i=1; i<=12; ++i)
+    {
+     WRITECOMMA( Rec.isRegionSelected(i) );
+    }
+
+   WRITECOMMA(Rec.Data.MerchantSic);
+   WRITECOMMA(Rec.Data.MerchantState);
+   WRITECOMMA(Rec.Data.MerchantZip);
+   WRITECOMMA(Rec.Data.MerchantService);
+   WRITECOMMA((unsigned long)Rec.Data.MerchantTimeZone);
+   WRITECOMMA(Rec.Data.VerifyAmount);
+   WRITECOMMA((unsigned long)Rec.Data.PreauthDays);
+   WRITECOMMA(Rec.Data.PreauthAmount);
+   WRITECOMMA(Rec.Data.HoldCheckAmount);
+   WRITECOMMA((unsigned long)Rec.Data.HoldCheck1Percent);
+   WRITECOMMA((unsigned long)Rec.Data.HoldCheckValuePercent);
+   WRITECOMMA((unsigned long)Rec.Data.ProductGroup);
+   WRITECOMMA(Rec.Data.MessageNumber);
+   WRITECOMMA(Rec.Data.Classes.Product);
+   WRITECOMMA(Rec.Data.Classes.GUAuthRules);
+   WRITECOMMA(Rec.Data.Classes.GUAuthRulesSub);
+   WRITECOMMA(Rec.Data.Classes.GUUnvFundsRules);
+   WRITECOMMA(Rec.Data.Classes.GUDataReq);
+   WRITECOMMA(Rec.Data.Classes.GUPosFileRules);
+   WRITECOMMA(Rec.Data.Classes.GURespMsg);
+   WRITECOMMA(Rec.Data.Classes.VFYAuthRules);
+   WRITECOMMA(Rec.Data.Classes.VFYAuthRulesSub);
+   WRITECOMMA(Rec.Data.Classes.VFYUnvFundsRules);
+   WRITECOMMA(Rec.Data.Classes.VFYDataReq);
+   WRITECOMMA(Rec.Data.Classes.VFYPosFileRules);
+   WRITELAST(Rec.Data.Classes.VFYRespMsg);
+
+  return true;
+ }
+
+};
+
+
+//------------------------------------------
+// Derived Formatter class for Positive File
+//------------------------------------------
+class CPosFileFormatter : public CFormatter
+{
+ struct PosfileRecord Rec;
+ int Length() { return sizeof(Rec); }
+ char* Buf() { return (char*)&Rec; }
+ bool WriteFieldsTemplate(FILE* f)
+  {
+   WRITECOMMA("BankNumber");
+   WRITECOMMA("BankAccount");
+   WRITECOMMA("LicenseState");
+   WRITECOMMA("License");
+   WRITECOMMA("LastApproval");
+   WRITECOMMA("FirstApproval");
+   WRITECOMMA("NumApprovals");
+   WRITECOMMA("AmountApprovals");
+   WRITECOMMA("DateOfBirth");
+   WRITECOMMA("NumOverridesAllowed");
+   WRITECOMMA("OverridePeriod");
+   WRITECOMMA("MaxOverrideAmount");
+   WRITECOMMA("MaxOverrideAccum");
+   WRITECOMMA("SicCodeRestriction1");
+   WRITECOMMA("SicCodeRestriction2");
+   WRITECOMMA("SicCodeRestriction3");
+   WRITECOMMA("AccountRestriction1");
+   WRITECOMMA("AccountRestriction2");
+   WRITECOMMA("AccountRestriction3");
+   WRITECOMMA("ConsumerName");
+   WRITECOMMA("BusinessName");
+   WRITELAST("Phone");
+
+   return true;
+  }
+
+ bool WriteFields(FILE* f)
+  {
+   WRITECOMMA(Rec.BankNumber);
+   WRITECOMMA(Rec.BankAccount);
+   WRITECOMMA(Rec.LicenseState);
+   WRITECOMMA(Rec.License);
+   WRITEDATE(Rec.LastApproval); COMMA;
+   WRITEDATE(Rec.FirstApproval); COMMA;
+   WRITECOMMA(Rec.NumApprovals);
+   WRITECOMMA(Rec.AmountApprovals);
+   if ( ! WriteDOB(f,Rec.DateOfBirth) )
+    return false;
+   COMMA;
+   WRITECOMMA(Rec.Parms.NumberOfOverridesAllowed);
+   WRITECOMMA(Rec.Parms.OverridePeriod);
+   WRITECOMMA(Rec.Parms.MaxOverrideAmount);
+   WRITECOMMA(Rec.Parms.MaxOverrideAccum);
+   WRITECOMMA(Rec.Parms.SicCodeRestrictions[0]);
+   WRITECOMMA(Rec.Parms.SicCodeRestrictions[1]);
+   WRITECOMMA(Rec.Parms.SicCodeRestrictions[2]);
+   WRITECOMMA(Rec.Parms.AccountRestrictions[0]);
+   WRITECOMMA(Rec.Parms.AccountRestrictions[1]);
+   WRITECOMMA(Rec.Parms.AccountRestrictions[2]);
+   WRITECOMMA(Rec.ConsumerInfo.ConsumerName);
+   WRITECOMMA(Rec.ConsumerInfo.BusinessName);
+   WRITELAST(Rec.PhoneKey);
+
+   return true;
+  }
+};
+
+
+
+//---------------------------------
+// Come here to quit with exit code
+//---------------------------------
+void quit(int ecode)
+{
+ if ( SessionHandle )
+  {
+   d_close(SessionHandle);
+   s_logout(SessionHandle);
+  }
+ if ( ecode==EXIT_SUCCESS )
+  cout << "DBEXPORT Complete." << endl;
+ else
+  cout << "  !!!!!!!!!!!!!!!!!!!!!!!!" << endl
+       << "  !!! DBEXPORT Aborted !!!" << endl
+       << "  !!!!!!!!!!!!!!!!!!!!!!!!" << endl;
+
+ cout << endl;
+ exit(ecode);
+}
+
+//--------------
+// Open Database
+//--------------
+void Open(const char* dbName)
+{
+ int Status;
+
+ if ( (Status=d_open(dbName,"xq",SessionHandle,&DBHandle)) != S_OKAY )
+  {
+   if ( Status==S_EXOPENED )
+    cout << "Can't open " << dbName << ". The server process is still running." << endl;
+   else
+    cout << "d_open returned " << Status
+      << endl;
+   quit(EXIT_FAILURE);
+  }
+}
+
+
+//--------------------
+// Close open database
+//--------------------
+void Close()
+{
+ int Status=d_close(SessionHandle);
+
+ if ( Status != S_OKAY )
+  {
+   cout << "d_close returned " << Status
+     << endl;
+   quit(EXIT_FAILURE);
+  }
+}
+
+//--------------------
+// Initialize Database
+//--------------------
+void Init(const char* Name)
+{
+ int Status;
+
+ // Initialize database
+ Close();
+ if ( (Status=s_dbInit(Name,SessionHandle)) != S_OKAY )
+  {
+   cout << "s_dbinit returned " << Status << endl;
+   quit(EXIT_FAILURE);
+  }
+ Open(Name);
+}
+
+//--------------------------------------
+// Copy all records of file to temp file
+//--------------------------------------
+void Export(short Type,const char* Name,CFormatter& Formatter,int ByKey=-1)
+{
+ int Status;
+ RecordCount=0;
+
+ strcpy(SaveFileName,DBPATH);
+ strcat(SaveFileName,Name);
+ strcat(SaveFileName,".exp");
+
+ cout << " Exporting Records to " << SaveFileName << "..." << endl;
+
+ if ( (SaveFile=fopen(SaveFileName, "w+b")) == NULL )
+  {
+   cout << "fopen of " << Name << " failed: " << strerror(errno) << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ if ( ! Formatter.WriteFieldsTemplate(SaveFile) )
+  {
+   cout << endl << "  fwrite failed: " << strerror(errno) << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ if ( ByKey == -1 )
+  {
+  if ( (Status=d_recfrst(Type,DBHandle)) != S_OKAY )
+   {
+    if ( Status==S_NOTFOUND )
+     {
+      cout << "  " << RecordCount << " Records Saved" << endl;
+      return;
+     }
+    cout << "  d_recfrst returned " << Status << endl;
+    quit(EXIT_FAILURE);
+   }
+  }
+  else
+  {
+   if ( (Status=d_keyfrst(ByKey,DBHandle)) != S_OKAY )
+    {
+     if ( Status==S_NOTFOUND )
+      {
+       cout << "  " << RecordCount << " Records Saved" << endl;
+       return;
+      }
+     cout << "  d_recfrst returned " << Status << endl;
+     quit(EXIT_FAILURE);
+   }
+  }
+
+ do
+  {
+   if ( (Status=d_recread(Type,Formatter.Buf(),DBHandle)) != S_OKAY )
+    {
+     cout << endl << "  d_recread returned " << Status << endl;
+     quit(EXIT_FAILURE);
+    }
+   if ( ! Formatter.WriteFields(SaveFile) )
+    {
+     cout << endl << "  fwrite failed: " << strerror(errno) << endl;
+     quit(EXIT_FAILURE);
+    }
+   cout << "  " << ++RecordCount << "\r";
+//   if ( RecordCount == 100 )
+//    break;
+   if ( ByKey == -1 )
+    Status = d_recnext(DBHandle);
+   else
+    Status = d_keynext(ByKey,DBHandle);
+
+  }
+ while( Status== S_OKAY );
+
+ cout << "  " << RecordCount << " Records Saved" << endl;
+
+ if ( Status != S_NOTFOUND )
+  {
+   cout << "d_recnext returned " << Status << endl;
+   quit(EXIT_FAILURE);
+  }
+
+ if ( fseek(SaveFile,0,SEEK_SET) == -1 )
+  {
+   cout << "  fseek failed: " << strerror(errno) << endl;
+   quit(EXIT_FAILURE);
+  }
+}
+
+//-----------------------------------
+// Do ending steps after database unload
+//-----------------------------------
+void CloseAll()
+{
+ cout << " Closing Database...." << endl;
+ Close();
+ cout << endl;
+ fclose(SaveFile);
+}
+
+//----------------------
+// Unload the Positive File
+//----------------------
+void ExportPositiveFile()
+{
+ CPosFileFormatter Format;
+
+ Open("posfile");
+ cout << "Exporting Positive File..." << endl;
+ Export(POSFILERECORD,"PosFile\\PosFile",Format);
+ CloseAll();
+}
+
+
+//----------------------
+// Unload the Merchant File
+//----------------------
+void ExportMerchantFile()
+{
+ CMerchantFileFormatter Format;
+
+ Open("spsmanv23");
+ cout << "Exporting Merchant File..." << endl;
+ Export(MERCHANTRECORD,"ManageDB\\Merchant",Format,MERCHANTID);
+ CloseAll();
+}
+
+
+//------------------------------------------------------
+// Main function. Get Selection from Args or else prompt
+//------------------------------------------------------
+void main(int argc,const char* argv[])
+{
+
+ short status;
+
+ SaveFileName = new char[MAX_PATH+1];
+ cout << "Start" << endl;
+ // LOGIN
+ if ( (status=s_login("rds","admin","secret",&SessionHandle)) != S_OKAY )
+  {
+   cout << "s_login returned " << status << "\n";
+   quit(EXIT_FAILURE);
+  }
+
+ int Key;
+ if ( argc== 1 )
+  {
+   cout << "  1. Positive File" << endl;
+   cout << "  2. Merchant File" << endl;
+   cout << "  A. All Files" << endl;
+   cout << "Export which File?";
+   Key=getch();
+   Interactive = TRUE;
+  }
+ else
+  Key = argv[1][0];
+
+ bool ALL=false;
+ cout << endl;
+ switch( Key )
+  {
+   case 'A':
+   case 'a': ALL=true;
+
+   case '1': ExportPositiveFile();
+             if ( ! ALL )
+              break;
+
+
+   case '2': ExportMerchantFile();
+             break;
+
+
+   default:  cout << "Unrecognized Selection" << endl;
+             exit(EXIT_FAILURE);
+  }
+
+
+ // Success
+ quit(EXIT_SUCCESS);
+}
+
+
